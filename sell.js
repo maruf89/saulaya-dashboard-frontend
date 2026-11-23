@@ -322,8 +322,10 @@ async function stockPage() {
   const rows = await api('/saulaya/sell/stock');
   const canEdit = me.role === 'admin' || me.role === 'editor';
   const reqIds = {};
-  const list = h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, 'Stock on hand'), rows.map(s => h('div', { class: 'sk' },
-    h('div', {}, h('div', {}, skuLabel(s), s.status !== 'live' ? h('span', { class: 'tag' }, s.status) : '', s.on_hand <= s.low_stock_at ? h('span', { class: 'tag low' }, 'low') : ''),
+  const shownRows = rows.filter(s => s.status === 'live' || s.on_hand !== 0); // draft or discontinued with nothing left stay out of the list
+  const list = h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, 'Stock on hand'), rows.length > shownRows.length
+    ? h('p', { class: 'hint' }, `${rows.length - shownRows.length} draft or discontinued item(s) with no stock are hidden.`) : '', shownRows.map(s => h('div', { class: 'sk' },
+    h('div', {}, h('div', {}, skuLabel(s), s.status !== 'live' ? h('span', { class: 'tag' }, s.status) : '', s.status === 'live' && s.on_hand <= s.low_stock_at ? h('span', { class: 'tag low' }, 'low') : ''),
       h('small', {}, `in ${s.in} · sold ${s.sold} · adjusted ${s.adjusted}`)),
     h('div', { class: 'n' }, String(s.on_hand)))));
   const skuSelect = () => h('select', {}, rows.map(s => opt(s.sku, skuLabel(s))));

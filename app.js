@@ -46,12 +46,21 @@ function note(text, err) {
 // Same site by default (nginx passes /api/ to the API). config.js can point it at another address.
 const API = (window.SAULAYA && window.SAULAYA.api) || '/api';
 let me = null; // { id, email, name, role } once logged in
-let tok = sessionStorage.getItem('at'), rt = sessionStorage.getItem('rt');
+// Logins are kept in localStorage so a refresh or a closed tab does not log you out (sessionStorage if that is blocked).
+const store = (() => { try { localStorage.setItem('_t', '1'); localStorage.removeItem('_t'); return localStorage; } catch { return sessionStorage; } })();
+let tok = store.getItem('at'), rt = store.getItem('rt');
 function setTokens(d) {
   tok = d.access_token; rt = d.refresh_token;
-  sessionStorage.setItem('at', tok); sessionStorage.setItem('rt', rt);
+  store.setItem('at', tok); store.setItem('rt', rt);
 }
-async function refresh() {
+// Directus replaces the refresh token each time it is used. Several requests failing at once must share ONE refresh
+// (a second use of the old token fails and would log you out), and another open tab may already have refreshed.
+let refreshing = null;
+const refresh = () => refreshing ||= doRefresh().finally(() => { refreshing = null; });
+async function doRefresh() {
+  const saved = store.getItem('at');
+  if (saved && saved !== tok) { tok = saved; rt = store.getItem('rt'); return true; }
+  rt = store.getItem('rt') || rt;
   if (!rt) return false;
   const r = await fetch(API + '/auth/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ refresh_token: rt, mode: 'json' }) });
@@ -73,7 +82,7 @@ async function api(path, opts = {}, retry = true) {
   }
   return j.data;
 }
-function logout(why) { sessionStorage.clear(); tok = rt = me = null; resetSell(); start(typeof why === 'string' ? why : ''); }
+function logout(why) { store.removeItem('at'); store.removeItem('rt'); sessionStorage.clear(); tok = rt = me = null; resetSell(); start(typeof why === 'string' ? why : ''); }
 
 // ---------- table config ----------
 const LANGS = ['en', 'fr', 'lt'], LANG_NAMES = { en: 'English', fr: 'French', lt: 'Lithuanian' };
@@ -87,7 +96,7 @@ const skuRef = f('sku', 'ref', { ref: ['skus', 'sku', 'sku'], l: 'sku' });
 const ingRef = (k, l, filter = { kind: 'ingredient' }, blank = '') => f(k, 'ref', { ref: ['ingredients', 'id', 'name'], num: true, l, filter, blank });
 const containerRef = f('jar_ingredient_id', 'ref', { ref: ['ingredients', 'id', 'name'], num: true, l: 'container type', filter: { kind: 'packaging', packaging_kind: 'container' } });
 const labelRef = (k, l, blank) => f(k, 'ref', { ref: ['ingredients', 'id', 'name'], num: true, l, filter: { kind: 'packaging', packaging_kind: 'label' }, blank });
-const STATUS = ['live', 'draft'];
+const STATUS = ['live', 'draft', 'discontinued']; // discontinued: no longer made; sold off while stock lasts
 
 const TABLES = {
   sales: {
@@ -121,13 +130,21 @@ const TABLES = {
     title: 'Recipes', pk: 'sku', sort: 'sku',
     list: ['sku', 'units_per_batch', 'labour_minutes_per_batch', 'labels_per_unit'],
     fields: [skuRef, f('ratios_from', 'ref', { ref: ['recipes', 'sku', 'sku'], filter: { ratios_from: null }, l: 'same ratios as', blank: 'own ingredient lines', hint: 'e.g. the 220g jar uses the 110g recipe' }),
+      f('scale_pct', 'n', { l: 'size vs original', unit: '%', hint: '50 = half, 200 = twice', showIf: ['ratios_from', '*'], offValue: 100 }),
       f('units_per_batch', 'n', { l: 'units per batch', hint: 'a unit is a jar or a pack' }), containerRef,
       labelRef('label_ingredient_id', 'label type', 'category default'),
-      f('labels_per_unit', 'n', { l: 'labels per unit' }), f('labour_minutes_per_batch', 'n'), f('batch_weight_g', 'n', { hint: 'optional. With "same ratios as": the grams in this batch' }),
+      f('labels_per_unit', 'n', { l: 'labels per unit' }), f('labour_minutes_per_batch', 'n'), f('batch_weight_g', 'n', { hint: 'optional, overrides the sum of the lines', showIf: ['ratios_from', ''] }),
       f('notes', 'area', { l: 'notes for making' })],
-    live: recipeLive,
+    live: recipeLive, defaults: () => ({ scale_pct: 100 }),
     kids: [{ table: 'recipe_lines', fk: 'sku', title: 'Ingredient lines (per batch)', link: 'ingredients', unless: 'ratios_from', calc: true,
       fields: [ingRef('ingredient_id', 'ingredient'), f('grams', 'n', { l: 'grams (or ml)', unit: 'g' }), f('drops', 'n')] }],
+  },
+  stock_batches: {
+    title: 'Batches', pk: 'id', sort: '-made_at,-id',
+    list: ['id', 'sku', 'made_at', 'quantity', 'batch_ref', 'notes'],
+    fields: [skuRef, f('made_at', 'dt'), f('quantity', 'n', { hint: 'does not change the ingredients that were taken out' }), f('batch_ref'), f('notes', 'area')],
+    defaults: () => ({ made_at: new Date().toISOString() }),
+    deleteWarn: 'The units leave the stock. Ingredients the batch already took out are not put back.',
   },
   skus: {
     title: 'SKUs', pk: 'sku', sort: 'sku',
@@ -347,7 +364,7 @@ async function recipeLive({ val, rows }) {
     let lines;
     if (base) {
       baseLines[base] ||= await api(`/items/recipe_lines?limit=-1&fields=ingredient_id,grams&filter[sku][_eq]=${encodeURIComponent(base)}`);
-      const total = sum(baseLines[base].map(l => Number(l.grams))), k = val('batch_weight_g') && total ? Number(val('batch_weight_g')) / total : 1;
+      const k = (Number(val('scale_pct')) || 100) / 100; // size as a share of the original recipe
       lines = baseLines[base].map(l => ({ id: l.ingredient_id, g: Number(l.grams) * k }));
     } else lines = rows().map(r => ({ id: Number(r._els[0].value), g: Number(r._els[1].value) || 0, row: r }));
     if (ticket !== busy) return; // a newer edit is already being worked out
@@ -533,7 +550,8 @@ async function recordPage(cfg, table_, id) {
   cfg.fields.forEach((fl, i) => {
     if (!fl.showIf) return;
     const src = els[cfg.fields.findIndex(x => x.k === fl.showIf[0])];
-    const sync = () => { const off = src.value !== fl.showIf[1]; els[i].disabled = off; if (off) els[i].value = ''; };
+    // showIf: [field, value]: enabled when that field equals value ('*' = anything chosen). Off = disabled and reset.
+    const sync = () => { const off = fl.showIf[1] === '*' ? !src.value : src.value !== fl.showIf[1]; els[i].disabled = off; if (off) els[i].value = fl.offValue ?? ''; };
     src.addEventListener('change', sync); sync();
   });
   kids.forEach(kid => kid.unless && unlessEl(kid).addEventListener('change', syncUnless)); syncUnless();
@@ -560,7 +578,8 @@ async function overviewPage() {
   const [stock, lines, gaps, ing, recipes] = await Promise.all([view('sku_stock'), view('sale_line_totals'),
     full ? view('recipe_gaps') : [], full ? view('ingredient_stock') : [], full ? api('/items/recipes?limit=-1&fields=sku') : []]);
   const since = Date.now() - 30 * 864e5, recent = lines.filter(l => new Date(l.sold_at) >= since);
-  const low = stock.filter(r => r.is_low).sort((a, b) => a.on_hand - b.on_hand);
+  const unused = r => r.status !== 'live' && Number(r.on_hand) === 0; // draft or discontinued, nothing left: not worth showing
+  const low = stock.filter(r => r.is_low && r.status === 'live').sort((a, b) => a.on_hand - b.on_hand);
   const have = new Set(recipes.map(r => r.sku)), sum = a => a.reduce((x, y) => x + Number(y || 0), 0);
   const stocked = ing.filter(r => Number(r.on_hand_base));
   return [h('h2', {}, 'Overview'),
@@ -576,8 +595,8 @@ async function overviewPage() {
     full ? [h('h3', {}, 'Recipes needing attention'),
       table(gaps.map(g => ({ sku: g.sku, status: g.status, missing: g.missing })),
         r => have.has(r.sku) ? `#/recipes/${encodeURIComponent(r.sku)}` : `#/recipes/new?sku=${encodeURIComponent(r.sku)}`)] : '',
-    h('details', {}, h('summary', {}, `Stock for every SKU (${stock.length})`),
-      table(stock.sort((a, b) => a.on_hand - b.on_hand), null, { hide: ['product_id', 'is_low'] })),
+    h('details', {}, h('summary', {}, `Stock for every SKU (${stock.filter(r => !unused(r)).length})`),
+      table(stock.filter(r => !unused(r)).sort((a, b) => a.on_hand - b.on_hand), null, { hide: ['product_id', 'is_low'] })),
     full ? h('details', {}, h('summary', {}, `Ingredient stock (${stocked.length} of ${ing.length} have stock recorded)`), table(ing)) : ''];
 }
 async function costsPage() {
@@ -601,7 +620,8 @@ async function batchPage() {
   h('div', { class: 'actions' }, h('button', { class: 'primary', type: 'submit' }, 'Make batch')),
   h('p', { class: 'muted' }, 'Scales the recipe to the units made and takes ingredients, containers and labels out of stock. Refused if the recipe is incomplete (see Overview).'));
   return [h('h2', {}, 'Make a batch'), form, h('h3', {}, 'Recent batches'),
-    table(await api('/items/stock_batches?limit=20&sort=-made_at'))];
+    h('p', { class: 'muted' }, 'Click a batch to correct or remove it. ', h('a', { href: '#/stock_batches' }, 'All batches')),
+    table(await api('/items/stock_batches?limit=20&sort=-made_at,-id'), r => `#/stock_batches/${r.id}`)];
 }
 
 // ---------- shell and routing ----------
