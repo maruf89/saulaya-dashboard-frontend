@@ -22,7 +22,7 @@ const fmt = v => v == null ? '' : Array.isArray(v) ? v.join(', ') : typeof v ===
 const when = d => d.toLocaleString(undefined, d.getHours() || d.getMinutes() ? { dateStyle: 'medium', timeStyle: 'short' } : { dateStyle: 'medium' });
 // Money and percent columns, by name. Labels never say "pct": the value carries the unit.
 const MONEY = new Set(['price', 'pack_price', 'total', 'unit_price', 'line_total', 'sale_price', 'ingredient_cost',
-  'ingredients_per_unit', 'labour_per_unit', 'packaging_per_unit', 'total_cost_per_unit', 'profit_per_unit', 'cost', 'profit', 'ingredients', 'packaging', 'labour']);
+  'ingredients_per_unit', 'labour_per_unit', 'packaging_per_unit', 'total_cost_per_unit', 'profit_per_unit', 'cost', 'profit', 'ingredients', 'packaging', 'labour', 'shipping_fee']);
 const PCT = new Set(['discount_pct', 'margin_pct']);
 const eur = new Intl.NumberFormat('en-IE', { style: 'currency', currency: 'EUR' });
 const lbl = c => c.replace(/_pct$/, '').replace(/(.)_id$/, '$1').replace(/_/g, ' ');
@@ -33,6 +33,12 @@ function cell(c, v, row) {
   return fmt(v);
 }
 
+// an amount kept in g / ml / units, shown in the ingredient's own unit (kg, l)
+const amt = (base, unit) => { const n = Number(base), r = x => Math.round(x * 10) / 10;
+  return base == null ? '' : unit === 'kg' || unit === 'g' ? (Math.abs(n) >= 1000 ? r(n / 1000) + ' kg' : r(n) + ' g')
+    : unit === 'l' || unit === 'ml' ? (Math.abs(n) >= 1000 ? r(n / 1000) + ' l' : r(n) + ' ml') : r(n) + (unit ? ' ' + unit : ''); };
+// a bare domain gets https://; anything else that is not http(s) is no link
+const webUrl = u => { u = (u || '').trim(); return /^https?:\/\//i.test(u) ? u : /^[^\s/:]+\.[^\s]+$/.test(u) ? 'https://' + u : ''; };
 const tile = (label, value, cls = '') => h('div', { class: 'stat ' + cls }, h('span', {}, label), h('b', {}, value));
 const isNum = v => typeof v === 'number' || (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v));
 
@@ -112,11 +118,13 @@ const TABLES = {
   purchases: {
     title: 'Purchases', pk: 'id', sort: '-id',
     list: ['id', 'purchased_on', 'supplier', 'description', 'total'],
-    fields: [f('purchased_on', 'd'), f('supplier'), f('description'), f('total', 'n', { unit: '€' })],
-    deleteWarn: 'Deleting a purchase does not take back the stock and price it added.',
+    fields: [f('purchased_on', 'd'), f('supplier'), f('description'), f('total', 'n', { unit: '€' }),
+      f('shipping_fee', 'n', { unit: '€', hint: 'optional' }), f('invoice_url', 'text', { l: 'invoice link', openUrl: true, hint: 'optional' }), f('invoice_file', 'file', { l: 'invoice file', hint: 'optional: PDF or photo' })],
+    deleteWarn: 'The ingredients it added leave the stock again. Ingredient prices stay as they are.',
     kids: [
-      { table: 'purchase_lines', fk: 'purchase_id', title: 'Ingredients', add: '+ Add Ingredient Line', appendOnly: 'Saved lines are locked: they already updated stock and the ingredient price.',
-        fields: [ingRef('ingredient_id', 'ingredient', {}), f('packs', 'n'), f('pack_price', 'n', { unit: '€' })] },
+      { table: 'purchase_lines', fk: 'purchase_id', title: 'Ingredients', add: '+ Add Ingredient Line', prefill: true,
+        fields: [ingRef('ingredient_id', 'ingredient', {}), f('packs', 'n', { l: 'packs bought' }), f('pack_size', 'n', { hint: 'size of one pack' }),
+          sel('pack_unit', ['kg', 'g', 'l', 'ml', 'unit']), f('pack_price', 'n', { l: 'price per pack', unit: '€' })] },
       { table: 'purchase_extras', fk: 'purchase_id', title: 'Other items', add: '+ Add Non-Ingredient Line', need: 0,
         fields: [f('description', 'text', { l: 'what was bought', hint: 'e.g. website domain, cups' }), f('amount', 'n', { unit: '€' })] }],
   },
@@ -167,7 +175,12 @@ const TABLES = {
   ingredients: {
     title: 'Ingredients', pk: 'id', sort: 'name',
     list: ['id', 'name', 'kind', 'packaging_kind', 'supplier', 'pack_size', 'pack_unit', 'pack_price'], hide: ['id', 'packaging_kind', 'pack_unit'],
-    enrich: async rows => rows.forEach(r => { if (r.packaging_kind) r.kind += ' · ' + r.packaging_kind; r.pack_size = r.pack_size == null ? null : `${fmt(r.pack_size)} ${r.pack_unit || ''}`; }),
+    enrich: async rows => {
+      const st = Object.fromEntries((await view('ingredient_stock')).map(s => [s.id, s]));
+      rows.forEach(r => { const s = st[r.id];
+        if (r.packaging_kind) r.kind += ' · ' + r.packaging_kind; r.pack_size = r.pack_size == null ? null : `${fmt(r.pack_size)} ${r.pack_unit || ''}`;
+        r.in_stock = s ? amt(s.on_hand_base, s.unit) + (s.is_low ? ' · low' : '') : ''; });
+    },
     defaults: () => ({ kind: 'ingredient' }),
     fields: [f('name'), sel('kind', ['ingredient', 'packaging']), sel('packaging_kind', ['container', 'label', 'other'], { showIf: ['kind', 'packaging'] }),
       f('organic', 'b'), f('supplier'), f('pack_size', 'n'), sel('pack_unit', ['kg', 'g', 'l', 'ml', 'unit']),
@@ -190,10 +203,10 @@ const NAV = [
   ['Day to day', [['overview', 'Overview'], ['sell', 'Sell'], ['report', 'Report'], ['stock', 'Stock'], ['sales', 'Sales'], ['batch', 'Make a batch'], ['purchases', 'Purchases'], ['adjustments', 'Adjustments']]],
   ['Making', [['recipes', 'Recipes'], ['ingredients', 'Ingredients'], ['costs', 'Costs']]],
   ['Catalogue', [['products', 'Products'], ['skus', 'SKUs'], ['categories', 'Categories']]],
-  ['Admin', [['users', 'Users'], ['settings', 'Settings']]]];
+  ['Admin', [['users', 'Users'], ['history', 'History'], ['settings', 'Settings']]]];
 // Admin and editor see every page. This only hides things: the API refuses what a role may not do.
 const ACCESS = { analyst: ['overview', 'report', 'stock'], clerk: ['sell'] };
-const canOpen = p => me.role === 'admin' || me.role === 'editor' || (ACCESS[me.role] || []).includes(p);
+const canOpen = p => p === 'history' ? me.role === 'admin' : me.role === 'admin' || me.role === 'editor' || (ACCESS[me.role] || []).includes(p);
 const isEditor = () => me.role === 'admin' || me.role === 'editor';
 const landing = () => me.role === 'clerk' ? 'sell' : 'overview';
 
@@ -216,12 +229,42 @@ function fieldInput(fl, v, ro) {
     case 'sel': el = h('select', {}, blank, fl.opts.map(o => h('option', { value: o, selected: o === v }, o))); break;
     case 'ref': { const [t, val, lab] = fl.ref;
       el = h('select', {}, blank, refCache[refKey(fl)].map(o => h('option', { value: o[val], selected: String(o[val]) === String(v) }, o[lab]))); break; }
+    case 'file': el = fileBox(v); break;
     case 'n': el = h('input', { type: 'number', step: 'any', value: v ?? '' }); break;
     case 'd': el = h('input', { type: 'date', value: v ?? '' }); break;
     case 'dt': el = h('input', { type: 'datetime-local', value: toLocal(v) }); break;
     default: el = h('input', { type: 'text', value: v ?? '' });
   }
   el.disabled = !!ro;
+  return el;
+}
+// An uploaded file (Directus /files): the box holds the file's id as its value, so it reads like any field.
+function fileBox(id) {
+  const el = h('div', { class: 'filebox' }), info = h('span', { class: 'muted' });
+  const pick = h('input', { type: 'file', accept: 'application/pdf,image/*' });
+  const open = h('button', { type: 'button', onclick: async () => {
+    const w = window.open('', '_blank'); // opened first so the browser does not block it
+    try {
+      const r = await fetch(`${API}/assets/${el.value}`, { headers: { Authorization: 'Bearer ' + tok } });
+      if (!r.ok) throw new Error('Could not open the file');
+      w.location = URL.createObjectURL(await r.blob());
+    } catch (e) { w.close(); note(e.message, true); }
+  } }, 'Open ↗');
+  const clear = h('button', { type: 'button', onclick: () => { el.value = ''; sync(); el.dispatchEvent(new Event('input', { bubbles: true })); } }, 'Remove');
+  const sync = () => { info.textContent = el.value ? 'File attached' : 'No file'; open.hidden = clear.hidden = !el.value; };
+  pick.addEventListener('change', async () => {
+    if (!pick.files[0]) return;
+    const send = () => { const fd = new FormData(); fd.append('file', pick.files[0]);
+      return fetch(API + '/files', { method: 'POST', headers: { Authorization: 'Bearer ' + tok }, body: fd }); };
+    try {
+      let r = await send();
+      if (r.status === 401 && await refresh()) r = await send();
+      if (!r.ok) throw new Error('Upload failed');
+      el.value = (await r.json()).data.id; sync(); el.dispatchEvent(new Event('input', { bubbles: true }));
+    } catch (e) { note(e.message, true); }
+    pick.value = '';
+  });
+  el.value = id ?? ''; el.append(info, open, clear, pick); sync();
   return el;
 }
 function readField(fl, el) {
@@ -233,8 +276,8 @@ function readField(fl, el) {
 }
 function urlButton(el) {
   const a = h('a', { class: 'btn', target: '_blank', rel: 'noopener noreferrer', title: 'Open this link in a new tab' }, 'Open ↗');
-  const set = () => { // a bare domain gets https://; anything else that is not http(s) gets no button
-    const u = el.value.trim(), full = /^https?:\/\//i.test(u) ? u : /^[^\s/:]+\.[^\s]+$/.test(u) ? 'https://' + u : '';
+  const set = () => {
+    const full = webUrl(el.value);
     a.hidden = !full; if (full) a.href = full;
   };
   el.addEventListener('input', set); set();
@@ -418,7 +461,7 @@ async function saleLive({ val, rows }) {
   }
   return { el, run };
 }
-let curLang = 'en', ingCache = {}, dispCache = {};
+let curLang = 'en', ingCache = {}, dispCache = {}, ingDef = {};
 async function loadDisplay(needed) {
   if (!needed) return;
   ingCache = Object.fromEntries((await api('/items/ingredients?limit=-1&fields=id,name,organic')).map(i => [i.id, i]));
@@ -443,6 +486,10 @@ const kidRow = (kid, row) => {
     h('div', { class: 'grid' }, fields.map((fl, i) => kid.tabs ? fieldRow(fl, els[i]) : (els[i].placeholder = fl.hint || '', fieldRow({ ...fl, hint: '' }, els[i]))), calc, open),
     locked || kid.tabs ? '' : h('button', { type: 'button', class: 'x', title: 'Remove', onclick: () => { const fm = div.closest('form'); div.remove(); fm?.dispatchEvent(new Event('input')); } }, '✕'));
   div._fields = fields; div._els = els; div._calc = calc;
+  if (kid.prefill) els[0].addEventListener('change', () => { // a new pack size and price per purchase: start from the ingredient's current ones
+    const d = ingDef[els[0].value];
+    if (d) { [els[2].value, els[3].value, els[4].value] = [d.pack_size ?? '', d.pack_unit ?? '', d.pack_price ?? '']; els[2].dispatchEvent(new Event('input', { bubbles: true })); }
+  });
   if (kid.link) {
     const set = () => { open.hidden = !els[0].value; open.href = `#/${kid.link}/${encodeURIComponent(els[0].value)}`; };
     els[0].addEventListener('change', set); set();
@@ -480,6 +527,7 @@ async function recordPage(cfg, table_, id) {
   const isNew = id === 'new', kids = cfg.kids || [];
   await loadRefs([...cfg.fields, ...kids.flatMap(k => k.fields)]);
   await loadDisplay(cfg.panel);
+  if (kids.some(k => k.prefill)) ingDef = Object.fromEntries((await api('/items/ingredients?limit=-1&fields=id,pack_size,pack_unit,pack_price')).map(i => [i.id, i]));
   let rec = {}, existing = kids.map(() => []);
   if (isNew) {
     rec = { ...(cfg.defaults?.() || {}), ...Object.fromEntries(new URLSearchParams(location.hash.split('?')[1] || '')) };
@@ -578,26 +626,33 @@ async function overviewPage() {
   const [stock, lines, gaps, ing, recipes] = await Promise.all([view('sku_stock'), view('sale_line_totals'),
     full ? view('recipe_gaps') : [], full ? view('ingredient_stock') : [], full ? api('/items/recipes?limit=-1&fields=sku') : []]);
   const since = Date.now() - 30 * 864e5, recent = lines.filter(l => new Date(l.sold_at) >= since);
-  const unused = r => r.status !== 'live' && Number(r.on_hand) === 0; // draft or discontinued, nothing left: not worth showing
+  const unused = r => r.status !== 'live' && (r.status === 'discontinued' ? Number(r.on_hand) <= 0 : Number(r.on_hand) === 0); // draft or sold-out discontinued: not worth showing
   const low = stock.filter(r => r.is_low && r.status === 'live').sort((a, b) => a.on_hand - b.on_hand);
   const have = new Set(recipes.map(r => r.sku)), sum = a => a.reduce((x, y) => x + Number(y || 0), 0);
-  const stocked = ing.filter(r => Number(r.on_hand_base));
+  const stocked = ing.filter(r => Number(r.on_hand_base)), restock = ing.filter(r => r.is_low).sort((a, b) => a.name.localeCompare(b.name));
   return [h('h2', {}, 'Overview'),
     h('div', { class: 'stats' },
       tile('Sales, last 30 days', eur.format(sum(recent.map(l => l.line_total)))),
       tile('Units sold, last 30 days', sum(recent.map(l => l.quantity))),
       tile('Units in stock', sum(stock.map(r => r.on_hand))),
       tile('Low on stock', low.length, low.length ? 'bad' : ''),
+      full ? tile('Ingredients to restock', restock.length, restock.length ? 'bad' : '') : '',
       full ? tile('Recipes incomplete', gaps.length, gaps.length ? 'warnt' : '') : ''),
     h('h3', {}, 'Low on stock'),
     low.length ? table(low.map(r => ({ sku: r.sku, on_hand: r.on_hand, low_stock_at: r.low_stock_at })), full ? r => `#/skus/${encodeURIComponent(r.sku)}` : null)
       : h('p', { class: 'muted' }, 'Every SKU is above its low-stock level.'),
-    full ? [h('h3', {}, 'Recipes needing attention'),
+    full ? [h('h3', {}, 'Ingredients to restock ', h('small', {}, 'less in stock than one batch of a live SKU needs')),
+      restock.length ? h('div', { class: 'tw' }, h('table', {}, h('thead', {}, h('tr', {}, ['Ingredient', 'On hand', 'One batch needs', 'For', 'Restock'].map((t, i) => h('th', { class: i === 1 || i === 2 ? 'num' : '' }, t)))),
+        h('tbody', {}, restock.map(r => h('tr', {}, h('td', {}, r.name), h('td', { class: 'num neg' }, amt(r.on_hand_base, r.unit)), h('td', { class: 'num' }, amt(r.need_base, r.unit)),
+          h('td', {}, r.skus.join(', ')), h('td', {}, r.supplier ? r.supplier + ' · ' : '', webUrl(r.link) ? h('a', { href: webUrl(r.link), target: '_blank', rel: 'noopener noreferrer' }, 'Buy ↗')
+            : h('a', { href: `#/ingredients/${r.id}` }, 'add link')))))))
+        : h('p', { class: 'muted' }, 'Every ingredient used by a live SKU covers at least one batch.'),
+      h('h3', {}, 'Recipes needing attention'),
       table(gaps.map(g => ({ sku: g.sku, status: g.status, missing: g.missing })),
         r => have.has(r.sku) ? `#/recipes/${encodeURIComponent(r.sku)}` : `#/recipes/new?sku=${encodeURIComponent(r.sku)}`)] : '',
     h('details', {}, h('summary', {}, `Stock for every SKU (${stock.filter(r => !unused(r)).length})`),
       table(stock.filter(r => !unused(r)).sort((a, b) => a.on_hand - b.on_hand), null, { hide: ['product_id', 'is_low'] })),
-    full ? h('details', {}, h('summary', {}, `Ingredient stock (${stocked.length} of ${ing.length} have stock recorded)`), table(ing)) : ''];
+    full ? h('details', {}, h('summary', {}, `Ingredient stock (${stocked.length} of ${ing.length} have stock recorded)`), table(ing.map(r => ({ id: r.id, name: r.name, on_hand: amt(r.on_hand_base, r.unit) })), r => `#/ingredients/${r.id}`, { hide: ['id'] })) : ''];
 }
 async function costsPage() {
   const have = new Set((await api('/items/recipes?limit=-1&fields=sku')).map(r => r.sku));
@@ -624,6 +679,33 @@ async function batchPage() {
     table(await api('/items/stock_batches?limit=20&sort=-made_at,-id'), r => `#/stock_batches/${r.id}`)];
 }
 
+// Admin only: every change with who made it, and a button to put it back.
+async function historyPage() {
+  const rows = await api('/saulaya/history?limit=300');
+  const show = v => v == null ? '∅' : String(typeof v === 'object' ? JSON.stringify(v) : v).slice(0, 40);
+  const what = r => r.op === 'c' ? 'created' : r.op === 'd' ? 'deleted · ' + Object.entries(r.old).filter(([, v]) => v != null).slice(0, 5).map(([k, v]) => `${lbl(k)} ${show(v)}`).join(', ')
+    : Object.keys(r.old).map(k => `${lbl(k)}: ${show(r.old[k])} → ${show(r.new[k])}`).join(' · ');
+  async function undo(r) {
+    if (!confirm(`Put this back?\n${r.tbl} ${r.pk}: ${what(r)}`)) return;
+    const url = `/items/${r.tbl}/${encodeURIComponent(r.pk)}`;
+    try {
+      if (r.op === 'u') await api(url, { method: 'PATCH', body: r.old });
+      else if (r.op === 'd') await api(`/items/${r.tbl}`, { method: 'POST', body: r.old }); // rows that went with it (a purchase's lines) are not restored
+      else await api(url, { method: 'DELETE' });
+      note('Reverted'); route();
+    } catch (e) { note(e.message, true); }
+  }
+  const tr = r => h('tr', {}, h('td', {}, when(new Date(r.at))), h('td', {}, r.who), h('td', {}, r.tbl.replace(/_/g, ' ')),
+    h('td', {}, TABLES[r.tbl] && r.op !== 'd' ? h('a', { href: `#/${r.tbl}/${encodeURIComponent(r.pk)}` }, r.pk) : r.pk),
+    h('td', { class: 'wrap' }, what(r)), h('td', {}, h('button', { onclick: () => undo(r) }, 'Revert')));
+  const body = h('tbody', {}, rows.map(tr));
+  const search = h('input', { type: 'search', placeholder: 'Filter by person, table or value…', oninput: e => {
+    const q = e.target.value.toLowerCase(); [...body.children].forEach(t => { t.hidden = !t.textContent.toLowerCase().includes(q); }); } });
+  return [h('div', { class: 'bar' }, h('h2', { style: 'margin:0' }, 'History'), search),
+    h('p', { class: 'muted' }, 'The latest 300 changes. Revert puts the old values back (and is itself recorded).'),
+    rows.length ? h('div', { class: 'tw' }, h('table', {}, h('thead', {}, h('tr', {}, ['When', 'Who', 'Table', 'Record', 'Change', ''].map(t => h('th', {}, t)))), body)) : h('p', { class: 'muted' }, 'No changes recorded yet.')];
+}
+
 // ---------- shell and routing ----------
 let navId = 0; // only the newest navigation may draw: a slow page must not overwrite the one clicked after it
 async function route() {
@@ -638,7 +720,7 @@ async function route() {
   try {
     const cfg = TABLES[name];
     const out = name === 'overview' ? await overviewPage() : name === 'costs' ? await costsPage() : name === 'batch' ? await batchPage()
-      : name === 'sell' ? await sellPage() : name === 'report' ? await reportPage() : name === 'stock' ? await stockPage() : name === 'users' ? await usersPage(id)
+      : name === 'sell' ? await sellPage() : name === 'report' ? await reportPage() : name === 'stock' ? await stockPage() : name === 'users' ? await usersPage(id) : name === 'history' ? await historyPage()
       : cfg ? (id ? await recordPage(cfg, name, id) : await listPage(cfg, name)) : [h('p', {}, 'Page not found')];
     if (mine === navId) main.replaceChildren(...out);
   } catch (e) { if (mine === navId) main.replaceChildren(h('p', { class: 'note err' }, e.message)); }
